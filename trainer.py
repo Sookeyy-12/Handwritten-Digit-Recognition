@@ -4,14 +4,19 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.optim.lr_scheduler import StepLR
+from PIL import Image
+import os
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
+import pickle
 
+# Define CNN Model
 class Net(nn.Module):
     def __init__(self):
         super(Net, self).__init__()
         self.conv1 = nn.Conv2d(1, 32, 3, 1)
         self.conv2 = nn.Conv2d(32, 64, 3, 1)
-        self.dropout1 = nn.Dropout(0.25)
-        self.dropout2 = nn.Dropout(0.5)
+        self.dropout1 = nn.Dropout(0.3)
+        self.dropout2 = nn.Dropout(0.6)
         self.fc1 = nn.Linear(9216, 128)
         self.fc2 = nn.Linear(128, 10)
 
@@ -30,67 +35,122 @@ class Net(nn.Module):
         output = F.log_softmax(x, dim=1)
         return output
 
-def train(model, device, train_loader, optimizer, epoch):
-    model.train()
-    for batch_idx, (data, target) in enumerate(train_loader):
-        data, target = data.to(device), target.to(device)
-        optimizer.zero_grad()
-        output = model(data)
-        loss = F.nll_loss(output, target)
-        loss.backward()
-        optimizer.step()
-        if batch_idx % 10 == 0:
-            print(f'Train Epoch: {epoch} [{batch_idx * len(data)}/{len(train_loader.dataset)} '
-                  f'({100. * batch_idx / len(train_loader):.0f}%)]\tLoss: {loss.item():.6f}')
+# Custom Dataset for Loading Corrected Images
+class CustomCorrectionDataset(Dataset):
+    def __init__(self, root, transform=None):
+        self.root = root
+        self.transform = transform
+        self.images = []
+        self.labels = []
 
-def test(model, device, test_loader):
-    model.eval()
-    test_loss = 0
-    correct = 0
-    with torch.no_grad():
-        for data, target in test_loader:
-            data, target = data.to(device), target.to(device)
-            output = model(data)
-            test_loss += F.nll_loss(output, target, reduction='sum').item()
-            pred = output.argmax(dim=1, keepdim=True)
-            correct += pred.eq(target.view_as(pred)).sum().item()
-    test_loss /= len(test_loader.dataset)
-    print(f'\nTest set: Average loss: {test_loss:.4f}, Accuracy: {correct}/{len(test_loader.dataset)} '
-          f'({100. * correct / len(test_loader.dataset):.0f}%)\n')
+        for filename in os.listdir(root):
+            if filename.endswith(".png"):
+                label = int(filename.split("_")[0])  # Extract label from filename
+                self.images.append(os.path.join(root, filename))
+                self.labels.append(label)
 
-def main():
-    # Hyperparameters
-    epochs = 14
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        image = Image.open(self.images[idx]).convert("L")
+        image = image.resize((28, 28))  # ✅ Ensure all images are 28x28
+        
+        if self.transform:
+            image = self.transform(image)
+
+        return image, self.labels[idx]
+
+# Training Function
+def train():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Adjust epochs based on training or retraining
+    is_retraining = os.path.exists("mnist_cnn.pkl")
+    if is_retraining:
+        print("Model found. Retraining with fewer epochs.")
+        epochs = 2  # Retraining
+    else:
+        print("No existing model found. Training from scratch.")
+        epochs = 15  # Full training
+
     batch_size = 64
-    test_batch_size = 1000
     lr = 1.0
     gamma = 0.7
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Dataloaders
-    train_kwargs = {'batch_size': batch_size, 'shuffle': True}
-    test_kwargs = {'batch_size': test_batch_size, 'shuffle': False}
+    # Transformations (Normalization + Augmentations)
     transform = transforms.Compose([
+        transforms.RandomRotation(10),  # Small rotations to generalize
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,))
     ])
-    dataset1 = datasets.MNIST('../data', train=True, download=True, transform=transform)
-    dataset2 = datasets.MNIST('../data', train=False, transform=transform)
-    train_loader = torch.utils.data.DataLoader(dataset1, **train_kwargs)
-    test_loader = torch.utils.data.DataLoader(dataset2, **test_kwargs)
 
-    model = Net().to(device)
+    # Load MNIST Dataset
+    mnist_dataset = datasets.MNIST('../data', train=True, download=True, transform=transform)
+
+    # Load Corrected Images if Available
+    correction_dataset = None
+    if os.path.exists("corrections/") and len(os.listdir("corrections/")) > 0:
+        correction_dataset = CustomCorrectionDataset(root="corrections/", transform=transform)
+
+    # Combine MNIST + Corrections
+    if correction_dataset:
+        train_dataset = ConcatDataset([mnist_dataset, correction_dataset])
+        print(f"Training on MNIST + {len(correction_dataset)} corrected images.")
+    else:
+        train_dataset = mnist_dataset
+        print("No corrections found. Training on MNIST only.")
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+    # Initialize Model
+    model = Net()
+    if is_retraining:
+        with open("mnist_cnn.pkl", "rb") as f:
+            model = torch.load(f, map_location='cpu')
+    model.to(device)
+
     optimizer = optim.Adadelta(model.parameters(), lr=lr)
     scheduler = StepLR(optimizer, step_size=1, gamma=gamma)
 
+    # Training Loop
     for epoch in range(1, epochs + 1):
-        train(model, device, train_loader, optimizer, epoch)
-        test(model, device, test_loader)
+        model.train()
+        for batch_idx, (data, target) in enumerate(train_loader):
+            data, target = data.to(device), target.to(device)
+            optimizer.zero_grad()
+            output = model(data)
+            loss = F.nll_loss(output, target)
+            loss.backward()
+            optimizer.step()
+
+            if batch_idx % 10 == 0:
+                print(f'Train Epoch: {epoch} [{batch_idx * len(data)}/{len(train_loader.dataset)} '
+                      f'({100. * batch_idx / len(train_loader):.0f}%)]\tLoss: {loss.item():.6f}')
+
         scheduler.step()
 
-    torch.save(model.state_dict(), "mnist_cnn.pt")
-    print("Training complete. Model saved.")
+    # Save Updated Model
+    with open("mnist_cnn.pkl", "wb") as f:
+        torch.save(model, f)
+    print("Training complete. Model updated!")
+
+    # Calculate Accuracy (only for full training)
+    if not is_retraining:
+        model.eval()
+        test_loader = DataLoader(datasets.MNIST('../data', train=False, transform=transform), batch_size=batch_size, shuffle=False)
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for data, target in test_loader:
+                data, target = data.to(device), target.to(device)
+                output = model(data)
+                pred = output.argmax(dim=1, keepdim=True)
+                correct += pred.eq(target.view_as(pred)).sum().item()
+                total += target.size(0)
+
+        accuracy = 100. * correct / total
+        print(f"Model Accuracy: {accuracy:.2f}%")
 
 if __name__ == "__main__":
-    main()
+    train()
